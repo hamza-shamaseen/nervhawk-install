@@ -40,27 +40,40 @@ preflight() {
     die "$version: this needs OpenSSL 3.0 or newer" "use Ubuntu 22.04 or 24.04, or Debian 12 or newer"
 }
 
-already_installed() { # a site this script did not start: refused before the code is spent
+already_installed() { # a site this script did not start, or finished: refused before the code is spent
+  [[ ! -f "$target/.install-state/complete" ]] || return 0
   [[ ! -f "$work/answer.json" ]] || return 1
-  [[ -f "$target/.install-state/complete" || -e "$target/deploy/site/secrets/hub/hub.creds" ]] && return 0
+  [[ -e "$target/deploy/site/secrets/hub/hub.creds" ]] && return 0
   [[ -n "$(docker ps -q --filter label=com.docker.compose.project=nhp-site)" ]]
 }
 
+code_hash() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; } # <secret>; printf is built in
+
 fetch_answer() { # <address> <fingerprint> <secret>
-  local address="$1" pin="$2" secret="$3" got status
+  local address="$1" pin="$2" secret="$3" got status failed=0
   # Unverified on purpose, and only this: the hash below is what decides whether it is trusted.
-  curl -fsSk --max-time 30 -o "$work/ca.crt" "https://$address/v1/install/ca" </dev/null ||
+  # Not ca.crt until the code is accepted: an earlier run's answer goes on to make the OS trust that.
+  curl -fsSk --max-time 30 -o "$work/ca.new" "https://$address/v1/install/ca" </dev/null ||
     die "the fleet at $address does not answer" "open TCP ${address##*:} from this machine to ${address%:*}"
-  got="$(sha256sum "$work/ca.crt" | cut -d' ' -f1)"
+  got="$(sha256sum "$work/ca.new" | cut -d' ' -f1)"
   [[ "$got" == "$pin" ]] ||
     die "the server at $address is not the fleet this code was made for; the code was not sent" "check this machine's network, then ask for a new code"
   # printf is built in, so the secret is on no command line.
-  status="$(printf '{"code":"%s"}' "$secret" | curl -sS --max-time 60 --cacert "$work/ca.crt" \
+  status="$(printf '{"code":"%s"}' "$secret" | curl -sS --max-time 60 --cacert "$work/ca.new" \
     -H 'Content-Type: application/json' --data-binary @- -o "$work/answer.part" \
-    -w '%{http_code}' "https://$address/v1/install/redeem")" ||
-    die "could not reach the fleet at $address securely" "the code was not spent; run this line again"
+    -w '%{http_code}' "https://$address/v1/install/redeem")" || failed=$?
+  case "$failed" in
+    0) ;;
+    # Before the request left: no name, no connection, a failed TLS handshake or certificate.
+    6 | 7 | 35 | 60) die "could not reach the fleet at $address securely" "the code was not spent; run this line again" ;;
+    *) die "the fleet at $address did not finish answering" "the code may have been spent: run this line again, and if it is refused, a new code works: ./nhp install-code <tenant>/<site>" ;;
+  esac
   case "$status" in
-    200) mv "$work/answer.part" "$work/answer.json" ;;
+    200)
+      mv "$work/answer.part" "$work/answer.json"
+      mv "$work/ca.new" "$work/ca.crt"
+      code_hash "$secret" >"$work/code.sha256"
+      ;;
     403) die "this code is unknown, used or expired" "make a new one: ./nhp install-code <tenant>/<site>" ;;
     *) die "the fleet answered $status" "try this line again in a minute; the code still works" ;;
   esac
@@ -170,7 +183,9 @@ main() {
   fi
   umask 077
   install -d -m 0700 "$work"
-  if [[ -f "$work/answer.json" ]]; then
+  # Only the code that earned the stored answer continues it: that answer's enrollment code may be
+  # spent or past its 24 h, and then a new code is the way out.
+  if [[ -f "$work/answer.json" && "$(cat "$work/code.sha256" 2>/dev/null)" == "$(code_hash "$secret")" ]]; then
     echo "continuing an earlier run: the code is not needed twice"
   else
     fetch_answer "$address" "$pin" "$secret"
